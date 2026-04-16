@@ -1,6 +1,5 @@
 .env
 storage/tokens.json
-storage/seen_jobs.json
 venv/
 __pycache__/
 *.pyc
