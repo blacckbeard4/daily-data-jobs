@@ -24,7 +24,7 @@ logger = get_logger()
 
 _FOOTER = (
     "All posted today. Updated every morning at 8AM ET.\n"
-    "👇 Which company do you want in tomorrow's list?\n"
+    "👇 What job title should I feature tomorrow? Drop it below.\n"
     "#DataJobs #DataEngineering #AIJobs"
 )
 
