@@ -2,7 +2,7 @@ name: Daily Data Jobs
 
 on:
   schedule:
-    - cron: '0 13 * * 2-5'   # 8AM ET (13:00 UTC) — Tue through Fri
+    - cron: '0 13 * * 1-5'   # 8AM ET (13:00 UTC) — Mon through Fri
   workflow_dispatch:           # manual trigger from GitHub UI
 
 jobs:
