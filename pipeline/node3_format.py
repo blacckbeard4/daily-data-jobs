@@ -23,7 +23,7 @@ from utils.logger import get_logger
 logger = get_logger()
 
 _FOOTER = (
-    "All posted today. Updated every morning at 8AM ET.\n"
+    "All posted today.\n"
     "👇 What job title should I feature tomorrow? Drop it below.\n"
     "#DataJobs #DataEngineering #AIJobs"
 )
