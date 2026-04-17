@@ -3,26 +3,26 @@
 ## What This Project Is
 An automated LinkedIn content pipeline that scrapes US data roles 
 posted in the last 24 hours, formats them into a daily LinkedIn post, 
-and publishes at 8AM ET every weekday (Tue-Fri, skip Monday).
+and publishes at 8AM ET every weekday (Mon-Fri).
 
 The value proposition: job seekers see fresh, curated, 
 salary-transparent data roles every morning before their workday starts.
 
 ## Owner Constraints
 - Zero or near-zero cost. Every architectural decision must respect this.
-- Deployed on Oracle Cloud Always Free ARM VM (Ubuntu, 4 CPU, 24GB RAM)
-- LLM: Azure OpenAI GPT-4.1-mini (student account, already deployed)
+- Deployed on GitHub Actions (public repo = unlimited free minutes)
+- LLM: Azure OpenAI GPT-4.1 (student account, already deployed)
 - No paid scraping proxies. No paid scheduling tools.
 - Must run unattended for 12 months with minimal human intervention.
 
 ## Tech Stack — Non-Negotiable
 - Language: Python 3.11+
-- Scheduler: Linux cron on Oracle VM
+- Scheduler: GitHub Actions cron (Mon-Fri 13:00 UTC = 8AM ET)
 - Scraping: Greenhouse API → Lever API → Dice → LinkedIn guest (tiered)
-- LLM: Azure OpenAI GPT-4.1-mini via openai Python SDK
+- LLM: Azure OpenAI GPT-4.1 via openai Python SDK (AzureOpenAI client)
 - LinkedIn Posting: /v2/ugcPosts endpoint (NOT /rest/posts)
-- Token storage: local JSON file, encrypted with simple key
-- Alerting: Gmail SMTP on failure
+- Token storage: storage/tokens.json encrypted with Fernet, stored as GitHub Secret
+- Alerting: Telegram Bot API (NOT Gmail SMTP)
 - Dependencies: managed via venv, pinned in requirements.txt
 
 ## Project File Structure
@@ -53,13 +53,13 @@ daily-data-jobs/
 │   ├── linkedin_auth.py       # OAuth flow + token refresh logic
 │   └── linkedin_post.py       # ugcPosts API call
 ├── storage/
-│   ├── tokens.json            # LinkedIn OAuth tokens (gitignored)
-│   ├── seen_jobs.json         # Dedup hash store (rolling 7 days)
+│   ├── tokens.json            # LinkedIn OAuth tokens (gitignored, stored as GitHub Secret)
+│   ├── seen_jobs.json         # Dedup hash store (rolling 7 days, committed to repo)
 │   └── companies_requested.txt # Community company requests from comments
 ├── utils/
 │   ├── __init__.py
 │   ├── logger.py              # Structured logging
-│   └── alerting.py            # Gmail SMTP failure alerts
+│   └── alerting.py            # Telegram Bot API failure alerts
 ├── tests/
 │   ├── test_scraper.py
 │   ├── test_pipeline.py
@@ -67,19 +67,33 @@ daily-data-jobs/
 └── main.py                    # Orchestrator — called by cron
 ```
 
-## Environment Variables (.env)
+## Environment Variables (.env locally / GitHub Secrets in CI)
 ```
 AZURE_OPENAI_API_KEY=
 AZURE_OPENAI_ENDPOINT=
-AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
+AZURE_OPENAI_DEPLOYMENT=gpt-4.1
 LINKEDIN_CLIENT_ID=
 LINKEDIN_CLIENT_SECRET=
-LINKEDIN_PERSON_URN=           # urn:li:person:{id}
-ALERT_EMAIL_FROM=
-ALERT_EMAIL_TO=
-ALERT_EMAIL_PASSWORD=          # Gmail app password
-TOKEN_ENCRYPTION_KEY=          # Simple Fernet key
+LINKEDIN_PERSON_URN=           # urn:li:person:{id} — auto-written by setup_oauth.py
+TELEGRAM_BOT_TOKEN=            # @Daily_jobs_justin_bot
+TELEGRAM_CHAT_ID=              # numeric chat ID — get via get_telegram_chat_id()
+TOKEN_ENCRYPTION_KEY=          # Fernet key
+LINKEDIN_TOKENS_JSON=          # base64(tokens.json) — GitHub Secret only
 ```
+
+## GitHub Actions — Deployment Details
+- Workflow: `.github/workflows/daily_post.yml`
+- Schedule: `0 13 * * 1-5` (8AM ET Mon-Fri)
+- Runner: ubuntu-latest (public repo = free)
+- Secrets set via: `gh secret set <NAME> --body <VALUE>`
+- tokens.json stored as base64 secret LINKEDIN_TOKENS_JSON, decoded at runtime
+- seen_jobs.json committed back to repo after each run (not gitignored)
+- Typical runtime: ~21 minutes (Greenhouse ~5.5 min + Lever ~15 min + LLM ~6s)
+- Lever is slower on GitHub Actions (~929s) vs local (~429s) due to runner network
+- To re-enable after disabling: `gh workflow enable daily_post.yml`
+- To trigger manually: `gh workflow run daily_post.yml`
+- Token refresh: when access token expires (~60 days), run setup_oauth.py locally,
+  then: `gh secret set LINKEDIN_TOKENS_JSON --body "$(base64 -i storage/tokens.json)"`
 
 ## Scraping Architecture — Critical Details
 
@@ -160,9 +174,9 @@ TOKEN_ENCRYPTION_KEY=          # Simple Fernet key
 
 ## LinkedIn Post Format — Exact Template
 ```
-[HOOK — max 140 chars, must fit before "see more" cutoff]
-10 data roles posted in the last 24 hours.
-Salary included. Real companies hiring today.
+[HOOK — dynamic, built from top 3 company names in ranked jobs]
+Fresh data roles from {Company1}, {Company2} & more.
+Salary included. Posted in the last 24 hours.
 
 ⚙️ DATA ENGINEER
 [Company] — [Job Title]
@@ -188,7 +202,7 @@ Stack: [tech1] · [tech2] · [tech3]
 [repeat same format x2]
 
 All posted today. Updated every morning at 8AM ET.
-👇 Which company do you want in tomorrow's list?
+👇 What job title should I feature tomorrow? Drop it below.
 #DataJobs #DataEngineering #AIJobs
 ```
 
@@ -229,61 +243,58 @@ All posted today. Updated every morning at 8AM ET.
 
 ### Token Management
 - Access token TTL: 60 days
-- Refresh token TTL: 365 days (fixed, does NOT roll)
-- Auto-refresh: check daily, refresh if < 5 days remaining
-- Refresh endpoint: `POST https://www.linkedin.com/oauth/v2/accessToken`
-- Refresh payload: `grant_type=refresh_token` + `refresh_token` + `client_id` + `client_secret`
-- Day 350 alert: send email warning that manual re-auth needed in 15 days
-- Day 365: refresh token dies, catch `invalid_grant`, send CRITICAL alert
-- Store tokens in: `storage/tokens.json` (gitignored, encrypted)
+- LinkedIn consumer apps do NOT return a refresh token — manual re-auth required every ~60 days
+- Auto-refresh logic exists in linkedin_auth.py but only works if refresh token is available
+- Telegram alert sent when access token < 5 days from expiry
+- Store tokens in: `storage/tokens.json` (gitignored locally, stored as LINKEDIN_TOKENS_JSON GitHub Secret)
 - Token file schema:
   ```json
   {access_token, refresh_token, access_expires_at, refresh_expires_at}
   ```
 
 ### OAuth Initial Setup
-- Scopes needed: `openid profile email w_member_social`
+- Scopes needed: `openid profile email w_member_social` (NOT offline_access — not supported by consumer apps)
+- DO NOT add offline_access — LinkedIn rejects it with invalid_scope error
 - Callback URL: `http://localhost:8000/callback` (for initial setup only)
 - Run setup once manually via: `python setup_oauth.py`
-- setup_oauth.py opens browser, completes flow, saves tokens.json
+- setup_oauth.py opens browser, completes flow, saves tokens.json, writes LINKEDIN_PERSON_URN to .env
+- Person URN fetched via `/v2/userinfo` (OpenID Connect) NOT `/v2/me` (deprecated, returns 403)
 
 ## Failure Handling + Alerting
 
-### What triggers an alert email
+### Alerting: Telegram Bot (NOT Gmail)
+- Bot: @Daily_jobs_justin_bot
+- send_alert(level, error_type, message, traceback) in utils/alerting.py
+- Uses requests.post to api.telegram.org/bot{token}/sendMessage with HTML parse_mode
+- get_telegram_chat_id() helper: calls getUpdates to find chat ID after sending /start
+
+### What triggers an alert
 - Scraper returns 0 jobs after all sources tried
 - LLM API call fails after 3 retries
 - LinkedIn post returns non-201 status
 - Token refresh fails (`invalid_grant` = CRITICAL)
 - Any unhandled exception in main.py
 
-### Alert email format
-```
-Subject: [DAILY DATA JOBS] {SEVERITY} — {error_type} — {date}
-Body: timestamp, error message, full traceback, suggested action
-```
-
 ### Retry logic
 - LLM calls: 3 retries with exponential backoff (2s, 4s, 8s)
 - LinkedIn post: 2 retries, then alert and skip day
 - Scrapers: fail silently per source, move to next tier
 
-## Cron Configuration
-```cron
-# Run Tue-Fri at 8AM ET (13:00 UTC)
-0 13 * * 2-5 /home/ubuntu/daily-data-jobs/venv/bin/python \
-  /home/ubuntu/daily-data-jobs/main.py >> \
-  /home/ubuntu/daily-data-jobs/logs/cron.log 2>&1
-```
+## Scheduling
+Handled by GitHub Actions — see `.github/workflows/daily_post.yml`.
+Cron: `0 13 * * 1-5` (Mon-Fri 8AM ET). No Oracle VM or local cron needed.
 
 ## What NOT to Do — Hard Rules
 - NEVER use `/rest/posts` endpoint
-- NEVER use `json_schema` response_format with GPT-4.1-mini (breaks)
+- NEVER use `json_schema` response_format with GPT-4.1 (breaks — use `json_object` only)
 - NEVER put more than 5 hashtags in a post
 - NEVER instruct users to use specific reactions (engagement bait penalty)
 - NEVER commit `.env` or `tokens.json` to git
 - NEVER run scrapers without delays between requests (min 2-3s sleep)
 - NEVER use headless browser — too heavy, not needed for ATS APIs
 - NEVER install packages globally — always use venv
+- NEVER add `offline_access` to OAuth scopes — LinkedIn consumer apps reject it
+- NEVER call `/v2/me` for person URN — use `/v2/userinfo` and read the `sub` field
 
 ## Testing Approach
 - Each module has a `--dry-run` flag that prints output without posting
@@ -296,10 +307,15 @@ Body: timestamp, error message, full traceback, suggested action
 - **ugcPosts not rest/posts**: consumer-tier tokens rejected by modern endpoint
 - **ATS-first scraping**: Greenhouse/Lever have free JSON APIs, zero bot risk
 - **3-node LLM chain**: monolithic prompt fails on simultaneous filter+rank+format
-- **json_object not json_schema**: strict schema breaks on GPT-4.1-mini
+- **json_object not json_schema**: strict schema breaks on GPT-4.1
 - **Personal profile not company page**: 5-8x more organic reach
 - **Links in post body**: accept 60% reach tradeoff for zero-friction UX
 - **No reaction voting**: engagement bait penalty in 2026 algorithm
-- **Company request CTA**: drives genuine comments, builds feedback loop
-- **Skip Monday**: lowest LinkedIn engagement day per 4.8M post analysis
+- **Job title CTA not company CTA**: "What title should I feature?" gets more actionable feedback than company requests
+- **Dynamic hook**: company names pulled from ranked jobs each day so hook is always fresh
+- **GitHub Actions not Oracle VM**: zero infrastructure to manage, free on public repos
+- **seen_jobs.json in repo**: committed back after each run so dedup persists across Actions runs
+- **Salary regex minimum $1,000**: bare values like "$124" appear in job description text and must not match
+- **apply_url re-attached after Node 1**: Pydantic FilteredJob model_dump() drops fields not in schema — re-attach via original_id lookup
 - **8AM ET**: East Coast morning professionals, best for job content specifically
+- **Mon-Fri**: expanded from Tue-Fri after launch
