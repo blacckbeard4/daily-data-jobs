@@ -18,7 +18,8 @@ salary-transparent data roles every morning before their workday starts.
 ## Tech Stack — Non-Negotiable
 - Language: Python 3.11+
 - Scheduler: GitHub Actions cron (Mon-Fri 11:00 UTC = 6AM ET)
-- Scraping: Greenhouse API → Lever API → Dice → LinkedIn guest (tiered)
+- Scraping: Greenhouse + Lever + Ashby + Himalayas + AIJobs* (all concurrent)
+  *AIJobs disabled — feed URL unavailable as of 2026-04
 - LLM: Azure OpenAI GPT-4.1 via openai Python SDK (AzureOpenAI client)
 - LinkedIn Posting: /v2/ugcPosts endpoint (NOT /rest/posts)
 - Image generation: Pillow (local, zero cost) — 1200x627 PNG header per post
@@ -41,8 +42,10 @@ daily-data-jobs/
 │   ├── __init__.py
 │   ├── greenhouse.py          # Greenhouse API scraper
 │   ├── lever.py               # Lever API scraper
-│   ├── dice.py                # Dice fallback scraper
-│   ├── linkedin_guest.py      # LinkedIn guest API (tertiary)
+│   ├── ashby.py               # Ashby ATS scraper (new)
+│   ├── himalayas.py           # Himalayas.app remote jobs scraper (new)
+│   ├── aijobs.py              # AIJobs.net — DISABLED (no feed URL)
+│   ├── _utils.py              # Shared utils: keywords, exclusions, tiebreaker
 │   └── deduplicator.py        # SHA-256 hash deduplication
 ├── pipeline/
 │   ├── __init__.py
@@ -99,35 +102,73 @@ LINKEDIN_TOKENS_JSON=          # base64(tokens.json) — GitHub Secret only
 
 ## Scraping Architecture — Critical Details
 
-### Priority Order (always try in this order)
-1. Greenhouse: `boards-api.greenhouse.io/v1/boards/{slug}/jobs`
-2. Lever: `api.lever.co/v0/postings/{slug}`
-3. Dice: `dice.com/jobs?q={role}&filters.postedDate=1`
-4. LinkedIn guest: `linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/`
-   with `f_TPR=r86400&f_E=3,4&geoId=103644278`
+### Active Scrapers (all run concurrently via asyncio.gather)
+1. **Greenhouse** — `boards-api.greenhouse.io/v1/boards/{slug}/jobs` — 112 slugs
+2. **Lever** — `api.lever.co/v0/postings/{slug}` — 111 slugs
+3. **Ashby** — `api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true` — 29 slugs
+4. **Himalayas** — `himalayas.app/jobs/api?limit=20&offset={n}` — paginated, remote-first feed
+5. **AIJobs** — DISABLED (aijobs.net has no RSS/API feed; returns empty list with log message)
+
+Note: Dice and LinkedIn guest scrapers have been removed. All scrapers run concurrently;
+individual failures are logged and skipped — never abort the whole run.
+
+### Himalayas API — Field Mapping (confirmed 2026-04)
+Raw field names: `companyName`, `applicationLink`, `pubDate` (Unix timestamp),
+`minSalary`, `maxSalary`, `currency`, `locationRestrictions` (list).
+Jobs missing `companyName` or `applicationLink` are skipped with a warning log.
 
 ### Target Job Categories (exactly 5, no others allowed)
 - Data Engineer
 - Data Analyst
 - ML Engineer
 - Data Scientist
-- AI Engineer  (also matches: GenAI Engineer, AI/ML Engineer)
+- AI Engineer  (also matches: GenAI Engineer, AI/ML Engineer, LLM Engineer)
 
-### Search Keywords per Category
-- Data Engineer: "data engineer", "analytics engineer"
-- Data Analyst: "data analyst", "business intelligence analyst"
-- ML Engineer: "machine learning engineer", "MLOps engineer"
-- Data Scientist: "data scientist", "applied scientist"
-- AI Engineer: "AI engineer", "generative AI engineer", "LLM engineer"
+### Search Keywords per Category (79 total — defined in config/settings.py)
+- **Data Engineer** (16): data engineer, analytics engineer, data platform, data infrastructure,
+  data architect, database engineer, etl developer, data modeler, data warehouse, big data,
+  streaming data, lakehouse, data integration engineer, cloud data engineer, real-time data,
+  analytics infrastructure
+- **Data Analyst** (15): data analyst, business intelligence analyst, product analyst,
+  growth analyst, insight analyst, insights analyst, operations analyst, analytics specialist,
+  quantitative analyst, strategic analyst, digital analyst, reporting specialist,
+  customer insights analyst, supply chain data analyst, revenue operations analyst
+- **ML Engineer** (15): machine learning engineer, mlops engineer, computer vision, nlp engineer,
+  deep learning, ml infrastructure, ml platform, machine learning scientist, algorithm engineer,
+  neural network, speech processing, recommendation engineer, ml solutions architect,
+  ai systems architect, mlops platform
+- **Data Scientist** (14): data scientist, applied scientist, quantitative researcher,
+  decision scientist, research scientist, statistician, forensic data, behavioral scientist,
+  predictive modeler, causal inference, operations research, inference scientist,
+  ai research scientist, machine learning researcher
+- **AI Engineer** (19): ai engineer, generative ai engineer, llm engineer, genai engineer,
+  ai/ml engineer, prompt engineer, ai product engineer, agent engineer, agentic systems,
+  ai evaluation, ai security engineer, rag engineer, conversational ai, multimodal engineer,
+  llm systems, foundation model engineer, ai infrastructure engineer, ai agent engineer,
+  ai research engineer
+
+### Category Overlap Tiebreaker
+When a title matches multiple categories, priority resolves the tie:
+**AI Engineer > ML Engineer > Data Scientist > Data Engineer > Data Analyst**
+Implemented in `scraper/_utils.get_primary_category()`. Logs at DEBUG when fired.
+Example: "ML Platform Engineer" → ML Engineer (beats Data Engineer)
+Example: "Deep Learning Research Scientist" → ML Engineer (beats Data Scientist)
 
 ### Experience Level Targeting
 - Include: Mid-Senior, Senior, Staff, Principal, Lead
-- Exclude: Junior, Entry-level, Intern, Graduate, 0-2 years
-- LinkedIn f_E parameter: 3,4 (Mid-Senior + Director)
+- Exclude (44 terms in config/settings.py EXPERIENCE_EXCLUDE_TERMS):
+  - Level: junior, entry, entry-level, intern, internship, graduate, new grad, early career, 0-2 years
+  - Wrong role: data entry, database administrator, dba, financial analyst, sales engineer,
+    support analyst, ux researcher, clinical researcher, ai trainer, ai writer, upwork, freelance, etc.
 
-### Geography
-- US only. Exclude: EMEA, APAC, Canada, Latin America
-- Accept: Remote (US), specific US cities, "United States"
+### Geography — Pre-LLM Filter
+`scraper/_utils.filter_non_us(job)` runs after scraping, before dedup/Node 1:
+- 2+ non-US country names in location → always exclude (global role)
+- 1 non-US country + no US indicator → exclude
+- 1 non-US country + US indicator present → keep
+- Blank location → keep (Node 1 LLM decides)
+Non-US countries checked: Australia, Brazil, Canada, UK, Germany, France, India, Singapore,
+Europe, EMEA, International, Worldwide, Global, and ~10 more.
 
 ### Deduplication
 - Generate SHA-256 hash of (company_name + job_title + location)
@@ -135,10 +176,11 @@ LINKEDIN_TOKENS_JSON=          # base64(tokens.json) — GitHub Secret only
 - Skip any job whose hash exists in last 7 days
 - Purge hashes older than 7 days on each run
 
-### ATS Company Slug List
-- Start with 200 companies in config/companies.json
-- Format: `{"greenhouse": ["airbnb", "stripe", "databricks", ...], "lever": ["netflix", "figma", ...]}`
-- Fetch this list from open source GitHub repos on first setup
+### ATS Company Slug List (config/companies.json)
+- Greenhouse: 112 slugs
+- Lever: 111 slugs (8 dead removed 2026-04: netflix, mistral, splunk, soda, weights-biases,
+  palantir, zoom, atlassian; 19 new added)
+- Ashby: 29 slugs (new key added 2026-04)
 
 ## LLM Pipeline — 3-Node Chain
 
@@ -316,7 +358,8 @@ All posted today.
 
 ## Scheduling
 Handled by GitHub Actions — see `.github/workflows/daily_post.yml`.
-Cron: `0 13 * * 1-5` (Mon-Fri 8AM ET). No Oracle VM or local cron needed.
+Cron: `0 11 * * 1-5` (Mon-Fri 6AM ET). No Oracle VM or local cron needed.
+To trigger manually: `gh workflow run 261589103` (use workflow ID — file name lookup is unreliable).
 
 ## What NOT to Do — Hard Rules
 - NEVER use `/rest/posts` endpoint
@@ -356,6 +399,11 @@ Cron: `0 13 * * 1-5` (Mon-Fri 8AM ET). No Oracle VM or local cron needed.
 - **Pillow for image generation**: zero cost, no external APIs, DejaVu Sans pre-installed on ubuntu-latest runner; hero job selected by highest salary ceiling
 - **Image upload non-fatal**: if registerUpload or PUT fails, pipeline falls back to text-only post and sends Telegram alert — never blocks the publish
 - **0 jobs on weekend manual trigger is expected**: 24-hour recency filter correctly returns nothing when no companies post on weekends; scheduled weekday runs are unaffected
+- **Concurrent scraping**: all 5 scrapers run via asyncio.gather(return_exceptions=True) — reduces runtime vs sequential; individual failures are logged and skipped
+- **Non-US pre-filter before LLM**: filter_non_us() in _utils.py rejects global roles (2+ non-US countries) before dedup and Node 1 — saves LLM calls and prevents multi-country location strings polluting the post
+- **Keyword tiebreaker**: get_primary_category() resolves multi-bucket title matches by priority (AI > ML > DS > DE > DA) — ensures consistent category assignment across all scrapers
+- **AIJobs disabled**: aijobs.net has no RSS feed or public API; all candidate URLs (feed/, rss/, rss.xml, sitemap.xml) return 404; scraper returns empty list with log message
+- **Himalayas field names**: companyName (not company.name), applicationLink (not applyUrl/url), pubDate is Unix timestamp (not ISO string), salary in minSalary/maxSalary fields
 
 ## Header Image — publisher/image_generator.py
 - Canvas: 1200×627px, background #0F1117
