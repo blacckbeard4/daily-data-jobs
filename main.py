@@ -29,19 +29,19 @@ from pipeline.node1_filter import run_node1
 from pipeline.node2_rank import rank_and_select
 from pipeline.node3_format import format_post
 from publisher.linkedin_post import post_comment_to_linkedin, post_to_linkedin
+from scraper._utils import filter_non_us
 from scraper.deduplicator import deduplicate
 from scraper.greenhouse import scrape_all_greenhouse
 from scraper.lever import scrape_all_lever
-from scraper.dice import scrape_dice
-from scraper.linkedin_guest import scrape_linkedin_guest
+from scraper.ashby import scrape_all_ashby
+from scraper.himalayas import scrape_himalayas
+from scraper.aijobs import scrape_aijobs
 from utils.alerting import send_alert
 from utils.logger import get_logger, setup_logger
 
 # Initialise logger early so all module-level loggers use the same instance
 setup_logger()
 logger = get_logger()
-
-_MIN_JOBS_BEFORE_FALLBACK = 5   # If fewer jobs, trigger Dice/LinkedIn guest fallback
 
 
 # ---------------------------------------------------------------------------
@@ -77,47 +77,52 @@ def _elapsed(start: float) -> str:
 
 async def run_scrapers(slugs: dict) -> list[dict]:
     """
-    Run all scrapers in priority order and return a combined flat job list.
+    Run all five scrapers concurrently and return a combined flat job list.
 
-    Priority: Greenhouse → Lever → (Dice + LinkedIn guest if needed)
+    Greenhouse, Lever, and Ashby scrape company-specific ATS boards.
+    Himalayas and AIJobs scrape broad job board feeds.
+    All run concurrently; individual failures are logged and skipped.
     """
     greenhouse_slugs: list[str] = slugs.get("greenhouse", [])
     lever_slugs: list[str] = slugs.get("lever", [])
+    ashby_slugs: list[str] = slugs.get("ashby", [])
 
-    # Tier 1: Greenhouse
     t = time.time()
-    logger.info(f"Scraper tier 1: Greenhouse ({len(greenhouse_slugs)} slugs) …")
-    greenhouse_jobs = await scrape_all_greenhouse(greenhouse_slugs)
-    logger.info(f"Greenhouse: {len(greenhouse_jobs)} jobs [{_elapsed(t)}]")
+    logger.info(
+        f"Starting all scrapers concurrently — "
+        f"Greenhouse ({len(greenhouse_slugs)} slugs), "
+        f"Lever ({len(lever_slugs)} slugs), "
+        f"Ashby ({len(ashby_slugs)} slugs), "
+        f"Himalayas, AIJobs …"
+    )
 
-    # Tier 2: Lever
-    t = time.time()
-    logger.info(f"Scraper tier 2: Lever ({len(lever_slugs)} slugs) …")
-    lever_jobs = await scrape_all_lever(lever_slugs)
-    logger.info(f"Lever: {len(lever_jobs)} jobs [{_elapsed(t)}]")
+    results = await asyncio.gather(
+        scrape_all_greenhouse(greenhouse_slugs),
+        scrape_all_lever(lever_slugs),
+        scrape_all_ashby(ashby_slugs),
+        scrape_himalayas(),
+        scrape_aijobs(),
+        return_exceptions=True,
+    )
 
-    all_jobs = greenhouse_jobs + lever_jobs
+    _NAMES = ["Greenhouse", "Lever", "Ashby", "Himalayas", "AIJobs"]
+    all_jobs: list[dict] = []
+    for name, result in zip(_NAMES, results):
+        if isinstance(result, Exception):
+            logger.error(f"{name} scraper raised an unhandled exception: {result}")
+        else:
+            logger.info(f"{name}: {len(result)} jobs")
+            all_jobs.extend(result)
 
-    # Tier 3 & 4: fallback scrapers if primary sources are thin
-    if len(all_jobs) < _MIN_JOBS_BEFORE_FALLBACK:
-        logger.warning(
-            f"Only {len(all_jobs)} jobs from primary sources — "
-            "triggering Dice + LinkedIn guest fallback scrapers."
-        )
+    logger.info(f"All scrapers finished in {_elapsed(t)}. Total raw jobs: {len(all_jobs)}")
 
-        t = time.time()
-        logger.info("Scraper tier 3: Dice …")
-        dice_jobs = await scrape_dice()
-        logger.info(f"Dice: {len(dice_jobs)} jobs [{_elapsed(t)}]")
-        all_jobs.extend(dice_jobs)
+    # Pre-LLM location filter: drop clearly non-US jobs before dedup/Node1
+    before = len(all_jobs)
+    all_jobs = [j for j in all_jobs if not filter_non_us(j)]
+    removed = before - len(all_jobs)
+    if removed:
+        logger.info(f"Non-US pre-filter: removed {removed} jobs, {len(all_jobs)} remaining.")
 
-        t = time.time()
-        logger.info("Scraper tier 4: LinkedIn guest …")
-        li_jobs = await scrape_linkedin_guest()
-        logger.info(f"LinkedIn guest: {len(li_jobs)} jobs [{_elapsed(t)}]")
-        all_jobs.extend(li_jobs)
-
-    logger.info(f"Total raw jobs from all scrapers: {len(all_jobs)}")
     return all_jobs
 
 
@@ -190,7 +195,8 @@ def main() -> None:
         slugs = load_company_slugs()
         logger.info(
             f"Loaded {len(slugs.get('greenhouse', []))} Greenhouse slugs, "
-            f"{len(slugs.get('lever', []))} Lever slugs."
+            f"{len(slugs.get('lever', []))} Lever slugs, "
+            f"{len(slugs.get('ashby', []))} Ashby slugs."
         )
 
         # --- Scrape ---

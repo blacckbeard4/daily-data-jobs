@@ -116,6 +116,46 @@ def is_excluded_experience(title: str) -> bool:
     return any(term in lower for term in EXPERIENCE_EXCLUDE_TERMS)
 
 
+_NON_US_COUNTRIES = {
+    "australia", "brazil", "canada", "uk", "united kingdom",
+    "germany", "france", "india", "singapore", "europe", "emea",
+    "international", "worldwide", "global", "mexico", "netherlands",
+    "poland", "spain", "italy", "sweden", "israel", "japan",
+    "south korea", "china", "new zealand", "ireland",
+}
+
+_US_INDICATORS = {"united states", "remote", "u.s.", "usa", "us "}
+
+
+def filter_non_us(job: dict) -> bool:
+    """
+    Return True if the job should be EXCLUDED because its location is
+    clearly non-US.
+
+    Rules:
+    - No location → keep (Node 1 LLM will decide)
+    - 2+ non-US country names present → always exclude (global role, even if
+      US is also listed — e.g. "Australia, Brazil, ... United States" is global)
+    - 1 non-US country present + no US indicator → exclude
+    - 1 non-US country present + US indicator also present → keep
+    """
+    location = (job.get("location") or "").lower()
+    if not location:
+        return False  # keep, let LLM decide
+
+    non_us_hits = sum(1 for country in _NON_US_COUNTRIES if country in location)
+    if non_us_hits == 0:
+        return False  # no non-US signal → keep
+
+    # 2+ non-US countries = global role, exclude regardless of US presence
+    if non_us_hits >= 2:
+        return True
+
+    # Exactly 1 non-US country: keep only if a US indicator is also present
+    has_us = any(us in location for us in _US_INDICATORS)
+    return not has_us
+
+
 async def random_delay() -> None:
     """
     Sleep for a random duration between SCRAPER_MIN_DELAY_SECONDS and

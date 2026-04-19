@@ -17,10 +17,11 @@ salary-transparent data roles every morning before their workday starts.
 
 ## Tech Stack — Non-Negotiable
 - Language: Python 3.11+
-- Scheduler: GitHub Actions cron (Mon-Fri 13:00 UTC = 8AM ET)
+- Scheduler: GitHub Actions cron (Mon-Fri 11:00 UTC = 6AM ET)
 - Scraping: Greenhouse API → Lever API → Dice → LinkedIn guest (tiered)
 - LLM: Azure OpenAI GPT-4.1 via openai Python SDK (AzureOpenAI client)
 - LinkedIn Posting: /v2/ugcPosts endpoint (NOT /rest/posts)
+- Image generation: Pillow (local, zero cost) — 1200x627 PNG header per post
 - Token storage: storage/tokens.json encrypted with Fernet, stored as GitHub Secret
 - Alerting: Telegram Bot API (NOT Gmail SMTP)
 - Dependencies: managed via venv, pinned in requirements.txt
@@ -50,8 +51,9 @@ daily-data-jobs/
 │   └── node3_format.py        # LLM Node 3: format LinkedIn post text
 ├── publisher/
 │   ├── __init__.py
+│   ├── image_generator.py     # Pillow 1200x627 header image — no external APIs
 │   ├── linkedin_auth.py       # OAuth flow + token refresh logic
-│   └── linkedin_post.py       # ugcPosts API call
+│   └── linkedin_post.py       # ugcPosts API call + image upload + first comment
 ├── storage/
 │   ├── tokens.json            # LinkedIn OAuth tokens (gitignored, stored as GitHub Secret)
 │   ├── seen_jobs.json         # Dedup hash store (rolling 7 days, committed to repo)
@@ -83,7 +85,7 @@ LINKEDIN_TOKENS_JSON=          # base64(tokens.json) — GitHub Secret only
 
 ## GitHub Actions — Deployment Details
 - Workflow: `.github/workflows/daily_post.yml`
-- Schedule: `0 13 * * 1-5` (8AM ET Mon-Fri)
+- Schedule: `0 11 * * 1-5` (6AM ET Mon-Fri)
 - Runner: ubuntu-latest (public repo = free)
 - Secrets set via: `gh secret set <NAME> --body <VALUE>`
 - tokens.json stored as base64 secret LINKEDIN_TOKENS_JSON, decoded at runtime
@@ -201,8 +203,10 @@ Stack: [tech1] · [tech2] · [tech3]
 ✨ AI / GEN AI ENGINEER
 [repeat same format x2]
 
-All posted today. Updated every morning at 8AM ET.
-👇 What job title should I feature tomorrow? Drop it below.
+All posted today.
+🔗 Apply links in first comment below ↓
+👥 Know someone job hunting? Tag them — you might change their week.
+🤝 Work at one of these companies and open to referring? Comment 'referral' + the company name and job seekers can reach out to you directly.
 #DataJobs #DataEngineering #AIJobs
 ```
 
@@ -210,9 +214,16 @@ All posted today. Updated every morning at 8AM ET.
 - Salary: always show if available. If not: show "Undisclosed"
 - Stack: extract from job description, max 4 technologies
 - Location: "Remote" / "Hybrid, [City]" / "[City], [State]"
-- Links: direct apply URL in post body (accept reach tradeoff)
+- Apply links: posted as first comment immediately after publish (NOT in post body)
 - Hashtags: exactly 3, always these exact 3
 - Character limit: hard stop at 2,800 chars, truncate gracefully
+
+### First Comment — Apply Links
+- Posted immediately after 201 response from ugcPosts
+- Endpoint: `POST /v2/socialActions/{encodedPostUrn}/comments`
+- Format: one line per job — `[Title] @ [Company] → [url]`
+- Failure is non-fatal: log error + Telegram alert, post stays live
+- Dry-run: prints comment payload to stdout, no API call
 
 ## LinkedIn API — Critical Implementation Details
 
@@ -222,24 +233,47 @@ All posted today. Updated every morning at 8AM ET.
 - Required header: `X-Restli-Protocol-Version: 2.0.0`
 - Required header: `Authorization: Bearer {access_token}`
 
-### Payload Schema
+### Payload Schema (text-only)
 ```json
 {
   "author": "urn:li:person:{id}",
   "lifecycleState": "PUBLISHED",
   "specificContent": {
     "com.linkedin.ugc.ShareContent": {
-      "shareCommentary": {
-        "text": "{post_text}"
-      },
+      "shareCommentary": { "text": "{post_text}" },
       "shareMediaCategory": "NONE"
     }
   },
-  "visibility": {
-    "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
-  }
+  "visibility": { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" }
 }
 ```
+
+### Payload Schema (with image)
+```json
+{
+  "author": "urn:li:person:{id}",
+  "lifecycleState": "PUBLISHED",
+  "specificContent": {
+    "com.linkedin.ugc.ShareContent": {
+      "shareCommentary": { "text": "{post_text}" },
+      "shareMediaCategory": "IMAGE",
+      "media": [{
+        "status": "READY",
+        "media": "{assetUrn}",
+        "title": { "text": "Today's top data roles" }
+      }]
+    }
+  },
+  "visibility": { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" }
+}
+```
+
+### Image Upload Flow (before ugcPosts call)
+1. Generate PNG: `publisher/image_generator.py` → `/tmp/ddj_header_{YYYYMMDD}.png`
+2. Register: `POST /v2/assets?action=registerUpload` with recipe `urn:li:digitalmediaRecipe:feedshare-image`
+3. Upload: `PUT {uploadUrl}` with `Content-Type: application/octet-stream`
+4. Use returned `asset` URN in ugcPosts payload
+- If any step fails: log + Telegram alert, fall back to text-only post (non-fatal)
 
 ### Token Management
 - Access token TTL: 60 days
@@ -309,13 +343,24 @@ Cron: `0 13 * * 1-5` (Mon-Fri 8AM ET). No Oracle VM or local cron needed.
 - **3-node LLM chain**: monolithic prompt fails on simultaneous filter+rank+format
 - **json_object not json_schema**: strict schema breaks on GPT-4.1
 - **Personal profile not company page**: 5-8x more organic reach
-- **Links in post body**: accept 60% reach tradeoff for zero-friction UX
+- **Apply links in first comment, not post body**: LinkedIn algorithm penalises outbound links in post body (~60% reach reduction); first comment preserves full reach with zero-friction UX
 - **No reaction voting**: engagement bait penalty in 2026 algorithm
-- **Job title CTA not company CTA**: "What title should I feature?" gets more actionable feedback than company requests
+- **Tag-a-friend + referral CTA**: replaced job-title CTA; drives shares (organic reach) and insider referral connections for job seekers
 - **Dynamic hook**: company names pulled from ranked jobs each day so hook is always fresh
 - **GitHub Actions not Oracle VM**: zero infrastructure to manage, free on public repos
 - **seen_jobs.json in repo**: committed back after each run so dedup persists across Actions runs
 - **Salary regex minimum $1,000**: bare values like "$124" appear in job description text and must not match
 - **apply_url re-attached after Node 1**: Pydantic FilteredJob model_dump() drops fields not in schema — re-attach via original_id lookup
-- **8AM ET**: East Coast morning professionals, best for job content specifically
+- **6AM ET**: moved from 8AM ET; hits feeds before the morning scroll peak
 - **Mon-Fri**: expanded from Tue-Fri after launch
+- **Pillow for image generation**: zero cost, no external APIs, DejaVu Sans pre-installed on ubuntu-latest runner; hero job selected by highest salary ceiling
+- **Image upload non-fatal**: if registerUpload or PUT fails, pipeline falls back to text-only post and sends Telegram alert — never blocks the publish
+- **0 jobs on weekend manual trigger is expected**: 24-hour recency filter correctly returns nothing when no companies post on weekends; scheduled weekday runs are unaffected
+
+## Header Image — publisher/image_generator.py
+- Canvas: 1200×627px, background #0F1117
+- Hero job: auto-selected as the job with the highest salary ceiling across all ranked jobs
+- Layout: "Today's top data roles" label → company (bold white, 58px) → role title → salary (teal #00C896, 52px) → 5 category pills (centered) → divider → footer
+- Font: DejaVu Sans (Ubuntu/CI) → Liberation Sans → Arial → macOS Helvetica → Pillow default
+- Output: `/tmp/ddj_header_{YYYYMMDD}.png` (dry-run: `/tmp/ddj_header_DRYRUN.png`)
+- Dry-run: generates image, prints path, sets asset URN to placeholder — no LinkedIn upload
