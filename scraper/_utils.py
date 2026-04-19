@@ -14,6 +14,19 @@ from config.settings import (
     SCRAPER_MAX_DELAY_SECONDS,
     SCRAPER_MIN_DELAY_SECONDS,
 )
+from utils.logger import get_logger
+
+_utils_logger = get_logger()
+
+# Priority order when a title matches multiple categories.
+# Higher index = higher priority (AI Engineer wins over Data Analyst).
+_CATEGORY_PRIORITY: list[str] = [
+    "Data Analyst",
+    "Data Engineer",
+    "Data Scientist",
+    "ML Engineer",
+    "AI Engineer",
+]
 
 # Pre-compiled salary regex — covers common US salary formats:
 # $120,000  /  $120k  /  $120K  /  $120,000 - $180,000  /  120000-180000 USD
@@ -94,17 +107,40 @@ def extract_salary(text: str) -> str | None:
     return None
 
 
+def get_primary_category(title: str) -> str | None:
+    """
+    Return the highest-priority category that matches this title, or None.
+
+    When a title matches multiple categories (e.g. 'ML Platform Engineer'
+    matches both ML Engineer and Data Engineer), the priority order resolves
+    the tie: AI Engineer > ML Engineer > Data Scientist > Data Engineer >
+    Data Analyst.
+    """
+    lower = title.lower()
+    matches: list[str] = []
+    for cat, keywords in CATEGORY_KEYWORDS.items():
+        if any(kw in lower for kw in keywords):
+            matches.append(cat)
+
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    # Multiple matches — pick highest priority
+    best = max(matches, key=lambda c: _CATEGORY_PRIORITY.index(c) if c in _CATEGORY_PRIORITY else -1)
+    _utils_logger.debug(
+        f"Category tiebreaker: '{title}' matched {matches} → assigned '{best}'"
+    )
+    return best
+
+
 def matches_category_keyword(title: str) -> bool:
     """
     Return True if the job title (case-insensitive) contains any keyword
     from any of the 5 target categories.
     """
-    lower = title.lower()
-    for keywords in CATEGORY_KEYWORDS.values():
-        for kw in keywords:
-            if kw in lower:
-                return True
-    return False
+    return get_primary_category(title) is not None
 
 
 def is_excluded_experience(title: str) -> bool:
