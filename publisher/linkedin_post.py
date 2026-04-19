@@ -17,14 +17,17 @@ import os
 import sys
 import time
 import traceback
+import urllib.parse
 
 import requests
 
 from config.settings import (
+    CATEGORY_ORDER,
     LINKEDIN_POST_MAX_CHARS,
     LINKEDIN_POST_RETRIES,
     LINKEDIN_UGCPOSTS_URL,
 )
+from publisher.image_generator import generate_image
 from publisher.linkedin_auth import get_valid_access_token
 from utils.alerting import send_alert
 from utils.logger import get_logger
@@ -36,18 +39,25 @@ _REQUIRED_HEADERS = {
     "Content-Type": "application/json",
 }
 
+LINKEDIN_ASSETS_URL = "https://api.linkedin.com/v2/assets"
+
 
 # ---------------------------------------------------------------------------
 # Payload construction
 # ---------------------------------------------------------------------------
 
-def build_ugcposts_payload(post_text: str, person_urn: str) -> dict:
+def build_ugcposts_payload(
+    post_text: str,
+    person_urn: str,
+    asset_urn: str | None = None,
+) -> dict:
     """
-    Build the exact ugcPosts JSON payload as specified in CLAUDE.md.
+    Build the ugcPosts JSON payload.
 
     Args:
-        post_text:  The formatted post text (must be <= LINKEDIN_POST_MAX_CHARS).
-        person_urn: The LinkedIn person URN (urn:li:person:{id}).
+        post_text:  Formatted post text (<= LINKEDIN_POST_MAX_CHARS).
+        person_urn: LinkedIn person URN.
+        asset_urn:  LinkedIn media asset URN; if set, attaches image.
 
     Raises:
         ValueError: If post_text exceeds the character limit.
@@ -56,14 +66,21 @@ def build_ugcposts_payload(post_text: str, person_urn: str) -> dict:
         raise ValueError(
             f"Post text is {len(post_text)} chars — exceeds limit of {LINKEDIN_POST_MAX_CHARS}."
         )
+    share_content: dict = {
+        "shareCommentary": {"text": post_text},
+        "shareMediaCategory": "IMAGE" if asset_urn else "NONE",
+    }
+    if asset_urn:
+        share_content["media"] = [{
+            "status": "READY",
+            "media": asset_urn,
+            "title": {"text": "Today's top data roles"},
+        }]
     return {
         "author": person_urn,
         "lifecycleState": "PUBLISHED",
         "specificContent": {
-            "com.linkedin.ugc.ShareContent": {
-                "shareCommentary": {"text": post_text},
-                "shareMediaCategory": "NONE",
-            }
+            "com.linkedin.ugc.ShareContent": share_content,
         },
         "visibility": {
             "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
@@ -108,9 +125,11 @@ def _send_with_retry(payload: dict, access_token: str) -> dict:
             post_urn = resp.headers.get("X-RestLi-Id", "unknown")
             logger.info(f"LinkedIn post published successfully. URN: {post_urn}")
             try:
-                return resp.json()
+                result = resp.json()
             except Exception:
-                return {"urn": post_urn}
+                result = {}
+            result["urn"] = post_urn
+            return result
 
         if 400 <= resp.status_code < 500:
             # Client errors — don't retry
@@ -146,16 +165,108 @@ def _send_with_retry(payload: dict, access_token: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Image upload helpers
+# ---------------------------------------------------------------------------
+
+def _register_image_upload(person_urn: str, access_token: str) -> tuple[str, str] | None:
+    """
+    Register an image upload with LinkedIn.
+    Returns (upload_url, asset_urn) on success, None on failure.
+    """
+    headers = {**_REQUIRED_HEADERS, "Authorization": f"Bearer {access_token}"}
+    payload = {
+        "registerUploadRequest": {
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+            "owner": person_urn,
+            "serviceRelationships": [{
+                "relationshipType": "OWNER",
+                "identifier": "urn:li:userGeneratedContent",
+            }],
+        }
+    }
+    try:
+        resp = requests.post(
+            f"{LINKEDIN_ASSETS_URL}?action=registerUpload",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.error(f"registerUpload returned {resp.status_code}: {resp.text[:300]}")
+            return None
+        value = resp.json().get("value", {})
+        upload_url = (
+            value
+            .get("uploadMechanism", {})
+            .get("com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest", {})
+            .get("uploadUrl")
+        )
+        asset_urn = value.get("asset")
+        if not upload_url or not asset_urn:
+            logger.error(f"registerUpload: missing uploadUrl or asset in response: {value}")
+            return None
+        return upload_url, asset_urn
+    except Exception as exc:
+        logger.error(f"registerUpload request failed: {exc}")
+        return None
+
+
+def _upload_image_bytes(upload_url: str, image_path: str, access_token: str) -> bool:
+    """PUT image bytes to LinkedIn's upload URL. Returns True on success."""
+    try:
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        resp = requests.put(
+            upload_url,
+            data=image_bytes,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/octet-stream",
+            },
+            timeout=60,
+        )
+        if resp.status_code in (200, 201):
+            logger.info("Image uploaded to LinkedIn successfully.")
+            return True
+        logger.error(f"Image PUT returned {resp.status_code}: {resp.text[:300]}")
+        return False
+    except Exception as exc:
+        logger.error(f"Image upload request failed: {exc}")
+        return False
+
+
+def upload_image_to_linkedin(image_path: str, person_urn: str, access_token: str) -> str | None:
+    """
+    Full image upload: register → PUT bytes.
+    Returns asset URN on success, or None on failure (non-fatal).
+    """
+    result = _register_image_upload(person_urn, access_token)
+    if not result:
+        send_alert("WARNING", "linkedin image upload", "registerUpload failed — posting text-only.")
+        return None
+    upload_url, asset_urn = result
+    if not _upload_image_bytes(upload_url, image_path, access_token):
+        send_alert(
+            "WARNING",
+            "linkedin image upload",
+            f"Image PUT failed — posting text-only. Asset: {asset_urn}",
+        )
+        return None
+    return asset_urn
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def post_to_linkedin(post_text: str, dry_run: bool = False) -> dict:
+def post_to_linkedin(post_text: str, ranked: dict | None = None, dry_run: bool = False) -> dict:
     """
-    Publish a post to LinkedIn.
+    Publish a post to LinkedIn, optionally with a generated header image.
 
     Args:
         post_text: The fully formatted post string.
-        dry_run:   If True, print the payload and return without posting.
+        ranked:    Ranked jobs dict used to generate the header image. Optional.
+        dry_run:   If True, generate image but skip all HTTP calls.
 
     Returns:
         On success: API response dict with post URN.
@@ -163,15 +274,21 @@ def post_to_linkedin(post_text: str, dry_run: bool = False) -> dict:
     """
     person_urn = os.environ.get("LINKEDIN_PERSON_URN", "")
 
-    if dry_run:
-        # URN not needed for dry-run — use placeholder if missing
-        payload = build_ugcposts_payload(post_text, person_urn or "urn:li:person:DRY_RUN")
-    else:
-        if not person_urn:
-            raise RuntimeError("LINKEDIN_PERSON_URN not set in environment.")
-        payload = build_ugcposts_payload(post_text, person_urn)
+    # --- Image generation (always attempt when ranked is provided) ---
+    image_path: str | None = None
+    asset_urn: str | None = None
+
+    if ranked:
+        image_path = generate_image(ranked, dry_run=dry_run)
+        if image_path:
+            if dry_run:
+                print(f"Image saved to {image_path}")
+                asset_urn = "urn:li:digitalmediaAsset:DRY_RUN"
+            # Live upload happens below after we have the access token
 
     if dry_run:
+        eff_urn = person_urn or "urn:li:person:DRY_RUN"
+        payload = build_ugcposts_payload(post_text, eff_urn, asset_urn)
         logger.info("[DRY RUN] LinkedIn post payload:")
         print("\n" + "=" * 60)
         print("LINKEDIN POST — DRY RUN")
@@ -185,8 +302,85 @@ def post_to_linkedin(post_text: str, dry_run: bool = False) -> dict:
         print("=" * 60 + "\n")
         return {"dry_run": True, "char_count": len(post_text), "payload": payload}
 
+    if not person_urn:
+        raise RuntimeError("LINKEDIN_PERSON_URN not set in environment.")
+
     access_token = get_valid_access_token()
+
+    if image_path:
+        asset_urn = upload_image_to_linkedin(image_path, person_urn, access_token)
+
+    payload = build_ugcposts_payload(post_text, person_urn, asset_urn)
     return _send_with_retry(payload, access_token)
+
+
+# ---------------------------------------------------------------------------
+# First-comment apply links
+# ---------------------------------------------------------------------------
+
+_SOCIAL_ACTIONS_BASE = "https://api.linkedin.com/v2/socialActions"
+
+
+def build_comment_text(ranked: dict) -> str:
+    """Build the apply-links comment text from ranked jobs."""
+    lines = ["🔗 Apply links:", ""]
+    for cat in CATEGORY_ORDER:
+        for job in ranked.get(cat, []):
+            title = job.get("title", "Role")
+            company = job.get("company", "Company")
+            url = job.get("apply_url", "")
+            lines.append(f"{title} @ {company} → {url}")
+    return "\n".join(lines)
+
+
+def post_comment_to_linkedin(
+    post_urn: str,
+    ranked: dict,
+    dry_run: bool = False,
+) -> None:
+    """
+    Post apply links as the first comment on the published post.
+
+    Non-fatal: logs error and sends alert on failure; never raises.
+    """
+    comment_text = build_comment_text(ranked)
+    person_urn = os.environ.get("LINKEDIN_PERSON_URN", "")
+
+    if dry_run:
+        print("\n" + "=" * 60)
+        print("LINKEDIN COMMENT — DRY RUN")
+        print("=" * 60)
+        print(f"Post URN: {post_urn}")
+        print("-" * 60)
+        print(comment_text)
+        print("=" * 60 + "\n")
+        return
+
+    if not person_urn:
+        logger.error("LINKEDIN_PERSON_URN not set — cannot post comment.")
+        return
+
+    encoded_urn = urllib.parse.quote(post_urn, safe="")
+    comment_url = f"{_SOCIAL_ACTIONS_BASE}/{encoded_urn}/comments"
+    payload = {
+        "actor": person_urn,
+        "message": {"text": comment_text},
+    }
+    access_token = get_valid_access_token()
+    headers = {**_REQUIRED_HEADERS, "Authorization": f"Bearer {access_token}"}
+
+    try:
+        resp = requests.post(comment_url, headers=headers, json=payload, timeout=30)
+        if resp.status_code == 201:
+            logger.info("Apply-links comment posted successfully.")
+        else:
+            msg = f"Comment API returned {resp.status_code}: {resp.text[:500]}"
+            logger.error(msg)
+            send_alert("WARNING", "linkedin comment", msg, f"Post URN: {post_urn}")
+    except requests.RequestException as exc:
+        msg = f"Comment API request failed: {exc}"
+        logger.error(msg)
+        send_alert("WARNING", "linkedin comment", msg, traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------

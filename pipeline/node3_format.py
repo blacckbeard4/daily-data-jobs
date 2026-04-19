@@ -24,7 +24,10 @@ logger = get_logger()
 
 _FOOTER = (
     "All posted today.\n"
-    "👇 What job title should I feature tomorrow? Drop it below.\n"
+    "🔗 Apply links in first comment below ↓\n"
+    "👥 Know someone job hunting? Tag them — you might change their week.\n"
+    "🤝 Work at one of these companies and open to referring? "
+    "Comment 'referral' + the company name and job seekers can reach out to you directly.\n"
     "#DataJobs #DataEngineering #AIJobs"
 )
 

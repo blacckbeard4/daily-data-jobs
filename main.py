@@ -28,7 +28,7 @@ from config.settings import COMPANIES_PATH
 from pipeline.node1_filter import run_node1
 from pipeline.node2_rank import rank_and_select
 from pipeline.node3_format import format_post
-from publisher.linkedin_post import post_to_linkedin
+from publisher.linkedin_post import post_comment_to_linkedin, post_to_linkedin
 from scraper.deduplicator import deduplicate
 from scraper.greenhouse import scrape_all_greenhouse
 from scraper.lever import scrape_all_lever
@@ -125,7 +125,7 @@ async def run_scrapers(slugs: dict) -> list[dict]:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(raw_jobs: list[dict], dry_run: bool) -> str:
+def run_pipeline(raw_jobs: list[dict], dry_run: bool) -> tuple[str, dict]:
     """
     Run the full processing pipeline: dedup → Node 1 → Node 2 → Node 3.
 
@@ -171,7 +171,7 @@ def run_pipeline(raw_jobs: list[dict], dry_run: bool) -> str:
         f"Node 3: post formatted — {len(post_text)} chars [{_elapsed(t)}]"
     )
 
-    return post_text
+    return post_text, ranked
 
 
 # ---------------------------------------------------------------------------
@@ -203,16 +203,19 @@ def main() -> None:
             sys.exit(1)
 
         # --- Pipeline ---
-        post_text = run_pipeline(raw_jobs, args.dry_run)
+        post_text, ranked = run_pipeline(raw_jobs, args.dry_run)
 
         # --- Publish ---
         logger.info("Publishing to LinkedIn …")
-        result = post_to_linkedin(post_text, dry_run=args.dry_run)
+        result = post_to_linkedin(post_text, ranked=ranked, dry_run=args.dry_run)
 
         if args.dry_run:
             logger.info("DRY RUN complete — no post was published.")
+            post_comment_to_linkedin("urn:li:ugcPost:DRY_RUN", ranked, dry_run=True)
         else:
+            post_urn = result.get("urn", "unknown")
             logger.info(f"LinkedIn post published: {result}")
+            post_comment_to_linkedin(post_urn, ranked, dry_run=False)
 
     except SystemExit:
         raise  # Allow clean sys.exit() calls from run_pipeline to propagate
