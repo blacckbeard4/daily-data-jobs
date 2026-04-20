@@ -24,7 +24,6 @@ logger = get_logger()
 
 _FOOTER = (
     "All posted today.\n"
-    "🔗 Apply links in first comment below ↓\n"
     "👥 Know someone job hunting? Tag them — you might change their week.\n"
     "🤝 Work at one of these companies and open to referring? "
     "Comment 'referral' + the company name and job seekers can reach out to you directly.\n"
@@ -66,7 +65,8 @@ def _build_hook(ranked: dict[str, list[dict]]) -> str:
 
     return (
         f"Fresh data roles from {company_str}.\n"
-        "Salary included. Posted in the last 24 hours."
+        "Posted in the last 24 hours.\n"
+        "🔗 Apply links in first comment below ↓"
     )
 
 
@@ -98,8 +98,6 @@ def format_job_block(job: dict) -> str:
 
     if stack:
         lines.append(f"Stack: {' · '.join(stack[:4])}")
-
-    lines.append(f"🔗 {apply_url}")
 
     return "\n".join(lines)
 

@@ -220,18 +220,17 @@ Europe, EMEA, International, Worldwide, Global, and ~10 more.
 ```
 [HOOK — dynamic, built from top 3 company names in ranked jobs]
 Fresh data roles from {Company1}, {Company2} & more.
-Salary included. Posted in the last 24 hours.
+Posted in the last 24 hours.
+🔗 Apply links in first comment below ↓
 
 ⚙️ DATA ENGINEER
 [Company] — [Job Title]
 📍 [Location] | 💰 [Salary or "Undisclosed"]
 Stack: [tech1] · [tech2] · [tech3]
-🔗 [apply_url]
 
 [Company] — [Job Title]
 📍 [Location] | 💰 [Salary or "Undisclosed"]
 Stack: [tech1] · [tech2] · [tech3]
-🔗 [apply_url]
 
 📊 DATA ANALYST
 [repeat same format x2]
@@ -246,7 +245,6 @@ Stack: [tech1] · [tech2] · [tech3]
 [repeat same format x2]
 
 All posted today.
-🔗 Apply links in first comment below ↓
 👥 Know someone job hunting? Tag them — you might change their week.
 🤝 Work at one of these companies and open to referring? Comment 'referral' + the company name and job seekers can reach out to you directly.
 #DataJobs #DataEngineering #AIJobs
