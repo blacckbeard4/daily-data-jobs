@@ -4,12 +4,16 @@ LLM Node 2 — Rank and select top 2 jobs per category.
 Pure Python implementation — no LLM call needed.
 The ranking is deterministic given the scoring rubric from Node 1.
 
-Tiebreaker order (descending priority):
-  1. salary_info present  (strongest signal for the audience)
-  2. remote_status = True (second most valued)
-  3. notability_score     (additive score from Node 1 rubric)
+Selection strategy (salary-first):
+  1. Take up to 2 jobs WITH salary per category (sorted by remote, then score).
+  2. Only fall back to no-salary jobs if a category would otherwise have 0 jobs
+     — never use them just to pad a category that already has 1 salary job.
 
-Output: dict with exactly 5 keys (one per category), each a list of <= 2 jobs.
+This keeps "Undisclosed" out of the post body except as a last resort.
+
+Tiebreaker within salary/no-salary groups (descending priority):
+  1. remote_status = True
+  2. notability_score
 """
 
 from config.settings import CATEGORY_ORDER
@@ -18,22 +22,17 @@ from utils.logger import get_logger
 logger = get_logger()
 
 
-def _tiebreaker_key(job: dict) -> tuple[int, int, int]:
-    """
-    Compute the sort key for a job (higher = better).
-
-    Returns a tuple so Python's lexicographic tuple comparison gives us
-    the right priority order when we sort descending.
-    """
-    salary_present = 1 if job.get("salary_info") else 0
+def _rank_key(job: dict) -> tuple[int, int]:
+    """Sort key within a salary/no-salary group. Higher = better."""
     remote = 1 if job.get("remote_status") else 0
     score = int(job.get("notability_score", 0))
-    return (salary_present, remote, score)
+    return (remote, score)
 
 
 def rank_and_select(filtered_jobs: list[dict]) -> dict[str, list[dict]]:
     """
-    Group jobs by category, sort by tiebreaker, and take the top 2 per category.
+    Group jobs by category, select up to 2 salary jobs per category.
+    Fall back to no-salary jobs only if a category would otherwise be empty.
 
     Args:
         filtered_jobs: Output of Node 1 — filtered, scored job dicts.
@@ -42,7 +41,6 @@ def rank_and_select(filtered_jobs: list[dict]) -> dict[str, list[dict]]:
         Dict with all 5 category keys, each holding a list of 0–2 job dicts.
         The dict is ordered to match the LinkedIn post template.
     """
-    # Initialise with all 5 categories in template order (even if empty)
     grouped: dict[str, list[dict]] = {cat: [] for cat in CATEGORY_ORDER}
 
     for job in filtered_jobs:
@@ -55,12 +53,33 @@ def rank_and_select(filtered_jobs: list[dict]) -> dict[str, list[dict]]:
 
     for cat in CATEGORY_ORDER:
         candidates = grouped[cat]
-        candidates.sort(key=_tiebreaker_key, reverse=True)
-        top2 = candidates[:2]
-        ranked[cat] = top2
-        total_selected += len(top2)
+
+        with_salary = sorted(
+            [j for j in candidates if j.get("salary_info")],
+            key=_rank_key,
+            reverse=True,
+        )
+        no_salary = sorted(
+            [j for j in candidates if not j.get("salary_info")],
+            key=_rank_key,
+            reverse=True,
+        )
+
+        if with_salary:
+            # Always prefer salary jobs; never mix in no-salary to pad to 2
+            selected = with_salary[:2]
+        else:
+            # Category would be empty — fall back to no-salary as last resort
+            selected = no_salary[:2]
+
+        ranked[cat] = selected
+        total_selected += len(selected)
+
+        salary_count = sum(1 for j in selected if j.get("salary_info"))
         logger.debug(
-            f"Node 2: {cat} — {len(candidates)} candidates → {len(top2)} selected."
+            f"Node 2: {cat} — {len(candidates)} candidates "
+            f"({len(with_salary)} w/ salary) → {len(selected)} selected "
+            f"({salary_count} with salary)."
         )
 
     logger.info(

@@ -13,12 +13,10 @@ Template:
 Rules:
 - Salary: show if present, else "Undisclosed"
 - Stack: max 4 technologies, joined with " · "
+- Apply URL: raw ATS link on 🔗 line — LinkedIn auto-shortens to lnkd.in on publish
 - Character limit: hard stop at 2,800 chars
 - Exactly 3 hashtags: #DataJobs #DataEngineering #AIJobs
-- URLs never appear in the post body (apply links go in first comment only)
 """
-
-import re
 
 from config.settings import CATEGORY_HEADERS, CATEGORY_ORDER, LINKEDIN_POST_MAX_CHARS
 from utils.logger import get_logger
@@ -26,10 +24,11 @@ from utils.logger import get_logger
 logger = get_logger()
 
 _FOOTER = (
-    "All posted today.\n"
+    "All posted today. Updated every morning at 8AM ET.\n"
     "👥 Know someone job hunting? Tag them — you might change their week.\n"
     "🤝 Work at one of these companies and open to referring? "
     "Comment 'referral' + the company name and job seekers can reach out to you directly.\n"
+    "🔔 Follow for fresh data roles every morning at 8AM ET.\n"
     "#DataJobs #DataEngineering #AIJobs"
 )
 
@@ -68,8 +67,7 @@ def _build_hook(ranked: dict[str, list[dict]]) -> str:
 
     return (
         f"Fresh data roles from {company_str}.\n"
-        "Posted in the last 24 hours.\n"
-        "🔗 Apply links in first comment below ↓"
+        "Posted in the last 24 hours."
     )
 
 
@@ -79,19 +77,19 @@ def _build_hook(ranked: dict[str, list[dict]]) -> str:
 
 def format_job_block(job: dict) -> str:
     """
-    Format a single job into its 3-line post block.
+    Format a single job into its 4-line post block.
 
     Example output:
         Databricks — Senior Data Engineer
         📍 Remote | 💰 $160,000 - $200,000
         Stack: Spark · Delta Lake · Python · SQL
-
-    Apply URLs are never in the post body — they go in the first comment.
+        🔗 https://boards.greenhouse.io/databricks/jobs/12345
     """
     company = job.get("company", "Unknown")
     title = job.get("title", "Unknown Role")
     location = job.get("location", "United States")
     salary = job.get("salary_info") or "Undisclosed"
+    apply_url = job.get("apply_url", "")
     stack = job.get("stack_keywords", [])
 
     lines = [
@@ -101,6 +99,9 @@ def format_job_block(job: dict) -> str:
 
     if stack:
         lines.append(f"Stack: {' · '.join(stack[:4])}")
+
+    if apply_url:
+        lines.append(f"🔗 {apply_url}")
 
     return "\n".join(lines)
 
@@ -133,11 +134,6 @@ def format_post(ranked: dict[str, list[dict]]) -> str:
 
     sections.append(_FOOTER)
     post = "\n\n".join(sections)
-
-    # Hard safety net — strip any URL that snuck in via LLM output or template drift.
-    # Apply links belong in the first comment only (LinkedIn penalises outbound links in body).
-    post = re.sub(r'https?://\S+', '', post)
-    post = re.sub(r'\n{3,}', '\n\n', post).strip()  # collapse any blank lines left by scrub
 
     char_count = len(post)
     logger.info(f"Node 3: post assembled — {char_count} characters.")

@@ -28,7 +28,7 @@ from config.settings import COMPANIES_PATH
 from pipeline.node1_filter import run_node1
 from pipeline.node2_rank import rank_and_select
 from pipeline.node3_format import format_post
-from publisher.linkedin_post import post_comment_to_linkedin, post_to_linkedin
+from publisher.linkedin_post import post_to_linkedin
 from scraper._utils import filter_non_us
 from scraper.deduplicator import deduplicate
 from scraper.greenhouse import scrape_all_greenhouse
@@ -213,15 +213,12 @@ def main() -> None:
 
         # --- Publish ---
         logger.info("Publishing to LinkedIn …")
-        result = post_to_linkedin(post_text, ranked=ranked, dry_run=args.dry_run)
+        result = post_to_linkedin(post_text, dry_run=args.dry_run)
 
         if args.dry_run:
             logger.info("DRY RUN complete — no post was published.")
-            post_comment_to_linkedin("urn:li:ugcPost:DRY_RUN", ranked, dry_run=True)
         else:
-            post_urn = result.get("urn", "unknown")
             logger.info(f"LinkedIn post published: {result}")
-            post_comment_to_linkedin(post_urn, ranked, dry_run=False)
 
     except SystemExit:
         raise  # Allow clean sys.exit() calls from run_pipeline to propagate

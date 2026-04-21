@@ -22,7 +22,7 @@ salary-transparent data roles every morning before their workday starts.
   *AIJobs disabled — feed URL unavailable as of 2026-04
 - LLM: Azure OpenAI GPT-4.1 via openai Python SDK (AzureOpenAI client)
 - LinkedIn Posting: /v2/ugcPosts endpoint (NOT /rest/posts)
-- Image generation: Pillow (local, zero cost) — 1200x627 PNG header per post
+- Image generation: None — removed; posts are text-only
 - Token storage: storage/tokens.json encrypted with Fernet, stored as GitHub Secret
 - Alerting: Telegram Bot API (NOT Gmail SMTP)
 - Dependencies: managed via venv, pinned in requirements.txt
@@ -54,9 +54,8 @@ daily-data-jobs/
 │   └── node3_format.py        # LLM Node 3: format LinkedIn post text
 ├── publisher/
 │   ├── __init__.py
-│   ├── image_generator.py     # Pillow 1200x627 header image — no external APIs
 │   ├── linkedin_auth.py       # OAuth flow + token refresh logic
-│   └── linkedin_post.py       # ugcPosts API call + image upload + first comment
+│   └── linkedin_post.py       # ugcPosts API call (text-only, no image, no comment)
 ├── storage/
 │   ├── tokens.json            # LinkedIn OAuth tokens (gitignored, stored as GitHub Secret)
 │   ├── seen_jobs.json         # Dedup hash store (rolling 7 days, committed to repo)
@@ -204,10 +203,11 @@ Europe, EMEA, International, Worldwide, Global, and ~10 more.
 
 ### Node 2: Rank + Select Top 2 Per Category
 - Input: filtered, scored jobs from Node 1
-- Select exactly top 2 per category (5 categories = 10 jobs total)
-- Tiebreaker: salary_info present > remote_status true > score
-- If fewer than 2 in a category, use what's available
-- Output: JSON object with 5 keys, one array per category
+- **Salary-first selection**: pick up to 2 jobs WITH salary per category first
+  - If a category has 1 salary job: take that 1 only — never pad with no-salary
+  - If a category has 0 salary jobs: fall back to no-salary (max 2) to prevent empty category
+- Tiebreaker within salary/no-salary groups: remote_status true > notability_score
+- Output: dict with 5 keys, one array per category (0–2 jobs each)
 
 ### Node 3: Format LinkedIn Post
 - Input: ranked top 10 jobs from Node 2
@@ -221,16 +221,17 @@ Europe, EMEA, International, Worldwide, Global, and ~10 more.
 [HOOK — dynamic, built from top 3 company names in ranked jobs]
 Fresh data roles from {Company1}, {Company2} & more.
 Posted in the last 24 hours.
-🔗 Apply links in first comment below ↓
 
 ⚙️ DATA ENGINEER
 [Company] — [Job Title]
 📍 [Location] | 💰 [Salary or "Undisclosed"]
 Stack: [tech1] · [tech2] · [tech3]
+🔗 [apply_url — raw ATS link, LinkedIn auto-shortens to lnkd.in]
 
 [Company] — [Job Title]
 📍 [Location] | 💰 [Salary or "Undisclosed"]
 Stack: [tech1] · [tech2] · [tech3]
+🔗 [apply_url]
 
 📊 DATA ANALYST
 [repeat same format x2]
@@ -244,9 +245,10 @@ Stack: [tech1] · [tech2] · [tech3]
 ✨ AI / GEN AI ENGINEER
 [repeat same format x2]
 
-All posted today.
+All posted today. Updated every morning at 8AM ET.
 👥 Know someone job hunting? Tag them — you might change their week.
 🤝 Work at one of these companies and open to referring? Comment 'referral' + the company name and job seekers can reach out to you directly.
+🔔 Follow for fresh data roles every morning at 8AM ET.
 #DataJobs #DataEngineering #AIJobs
 ```
 
@@ -254,16 +256,10 @@ All posted today.
 - Salary: always show if available. If not: show "Undisclosed"
 - Stack: extract from job description, max 4 technologies
 - Location: "Remote" / "Hybrid, [City]" / "[City], [State]"
-- Apply links: posted as first comment immediately after publish (NOT in post body)
+- Apply links: raw ATS URL on 🔗 line in post body — LinkedIn auto-shortens to lnkd.in on publish
 - Hashtags: exactly 3, always these exact 3
 - Character limit: hard stop at 2,800 chars, truncate gracefully
-
-### First Comment — Apply Links
-- Posted immediately after 201 response from ugcPosts
-- Endpoint: `POST /v2/socialActions/{encodedPostUrn}/comments`
-- Format: one line per job — `[Title] @ [Company] → [url]`
-- Failure is non-fatal: log error + Telegram alert, post stays live
-- Dry-run: prints comment payload to stdout, no API call
+- No auto-comment after posting — apply links are in the post body
 
 ## LinkedIn API — Critical Implementation Details
 
@@ -287,33 +283,6 @@ All posted today.
   "visibility": { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" }
 }
 ```
-
-### Payload Schema (with image)
-```json
-{
-  "author": "urn:li:person:{id}",
-  "lifecycleState": "PUBLISHED",
-  "specificContent": {
-    "com.linkedin.ugc.ShareContent": {
-      "shareCommentary": { "text": "{post_text}" },
-      "shareMediaCategory": "IMAGE",
-      "media": [{
-        "status": "READY",
-        "media": "{assetUrn}",
-        "title": { "text": "Today's top data roles" }
-      }]
-    }
-  },
-  "visibility": { "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC" }
-}
-```
-
-### Image Upload Flow (before ugcPosts call)
-1. Generate PNG: `publisher/image_generator.py` → `/tmp/ddj_header_{YYYYMMDD}.png`
-2. Register: `POST /v2/assets?action=registerUpload` with recipe `urn:li:digitalmediaRecipe:feedshare-image`
-3. Upload: `PUT {uploadUrl}` with `Content-Type: application/octet-stream`
-4. Use returned `asset` URN in ugcPosts payload
-- If any step fails: log + Telegram alert, fall back to text-only post (non-fatal)
 
 ### Token Management
 - Access token TTL: 60 days
@@ -384,7 +353,11 @@ To trigger manually: `gh workflow run 261589103` (use workflow ID — file name 
 - **3-node LLM chain**: monolithic prompt fails on simultaneous filter+rank+format
 - **json_object not json_schema**: strict schema breaks on GPT-4.1
 - **Personal profile not company page**: 5-8x more organic reach
-- **Apply links in first comment, not post body**: LinkedIn algorithm penalises outbound links in post body (~60% reach reduction); first comment preserves full reach with zero-friction UX
+- **Apply links in post body (🔗 line per job)**: raw ATS URLs passed through; LinkedIn auto-shortens to lnkd.in format on publish. No auto-comment fires after posting.
+  - Greenhouse `absolute_url` → company's own career page (`careers.airbnb.com/...?gh_jid=...`)
+  - Lever `hostedUrl` → `jobs.lever.co/{company}/{uuid}` (NOT `applyUrl` which ends in `/apply`)
+  - Ashby `applyUrl` → `jobs.ashbyhq.com/{slug}/{id}`
+  - Himalayas `applicationLink` → direct job page link
 - **No reaction voting**: engagement bait penalty in 2026 algorithm
 - **Tag-a-friend + referral CTA**: replaced job-title CTA; drives shares (organic reach) and insider referral connections for job seekers
 - **Dynamic hook**: company names pulled from ranked jobs each day so hook is always fresh
@@ -394,19 +367,12 @@ To trigger manually: `gh workflow run 261589103` (use workflow ID — file name 
 - **apply_url re-attached after Node 1**: Pydantic FilteredJob model_dump() drops fields not in schema — re-attach via original_id lookup
 - **6AM ET**: moved from 8AM ET; hits feeds before the morning scroll peak
 - **Mon-Fri**: expanded from Tue-Fri after launch
-- **Pillow for image generation**: zero cost, no external APIs, DejaVu Sans pre-installed on ubuntu-latest runner; hero job selected by highest salary ceiling
-- **Image upload non-fatal**: if registerUpload or PUT fails, pipeline falls back to text-only post and sends Telegram alert — never blocks the publish
+- **No image generation**: Pillow and image_generator.py removed — posts are text-only; simplifies pipeline, no image upload failures possible
 - **0 jobs on weekend manual trigger is expected**: 24-hour recency filter correctly returns nothing when no companies post on weekends; scheduled weekday runs are unaffected
 - **Concurrent scraping**: all 5 scrapers run via asyncio.gather(return_exceptions=True) — reduces runtime vs sequential; individual failures are logged and skipped
 - **Non-US pre-filter before LLM**: filter_non_us() in _utils.py rejects global roles (2+ non-US countries) before dedup and Node 1 — saves LLM calls and prevents multi-country location strings polluting the post
 - **Keyword tiebreaker**: get_primary_category() resolves multi-bucket title matches by priority (AI > ML > DS > DE > DA) — ensures consistent category assignment across all scrapers
 - **AIJobs disabled**: aijobs.net has no RSS feed or public API; all candidate URLs (feed/, rss/, rss.xml, sitemap.xml) return 404; scraper returns empty list with log message
 - **Himalayas field names**: companyName (not company.name), applicationLink (not applyUrl/url), pubDate is Unix timestamp (not ISO string), salary in minSalary/maxSalary fields
+- **Salary-first ranking (Node 2)**: always pick salary jobs over no-salary per category; only show "Undisclosed" when an entire category has zero salary data — never pad a 1-salary category with a no-salary job
 
-## Header Image — publisher/image_generator.py
-- Canvas: 1200×627px, background #0F1117
-- Hero job: auto-selected as the job with the highest salary ceiling across all ranked jobs
-- Layout: "Today's top data roles" label → company (bold white, 58px) → role title → salary (teal #00C896, 52px) → 5 category pills (centered) → divider → footer
-- Font: DejaVu Sans (Ubuntu/CI) → Liberation Sans → Arial → macOS Helvetica → Pillow default
-- Output: `/tmp/ddj_header_{YYYYMMDD}.png` (dry-run: `/tmp/ddj_header_DRYRUN.png`)
-- Dry-run: generates image, prints path, sets asset URN to placeholder — no LinkedIn upload
