@@ -15,7 +15,10 @@ Rules:
 - Stack: max 4 technologies, joined with " · "
 - Character limit: hard stop at 2,800 chars
 - Exactly 3 hashtags: #DataJobs #DataEngineering #AIJobs
+- URLs never appear in the post body (apply links go in first comment only)
 """
+
+import re
 
 from config.settings import CATEGORY_HEADERS, CATEGORY_ORDER, LINKEDIN_POST_MAX_CHARS
 from utils.logger import get_logger
@@ -76,19 +79,19 @@ def _build_hook(ranked: dict[str, list[dict]]) -> str:
 
 def format_job_block(job: dict) -> str:
     """
-    Format a single job into its 4-line post block.
+    Format a single job into its 3-line post block.
 
     Example output:
         Databricks — Senior Data Engineer
         📍 Remote | 💰 $160,000 - $200,000
         Stack: Spark · Delta Lake · Python · SQL
-        🔗 https://boards.greenhouse.io/...
+
+    Apply URLs are never in the post body — they go in the first comment.
     """
     company = job.get("company", "Unknown")
     title = job.get("title", "Unknown Role")
     location = job.get("location", "United States")
     salary = job.get("salary_info") or "Undisclosed"
-    apply_url = job.get("apply_url", "")
     stack = job.get("stack_keywords", [])
 
     lines = [
@@ -130,6 +133,11 @@ def format_post(ranked: dict[str, list[dict]]) -> str:
 
     sections.append(_FOOTER)
     post = "\n\n".join(sections)
+
+    # Hard safety net — strip any URL that snuck in via LLM output or template drift.
+    # Apply links belong in the first comment only (LinkedIn penalises outbound links in body).
+    post = re.sub(r'https?://\S+', '', post)
+    post = re.sub(r'\n{3,}', '\n\n', post).strip()  # collapse any blank lines left by scrub
 
     char_count = len(post)
     logger.info(f"Node 3: post assembled — {char_count} characters.")

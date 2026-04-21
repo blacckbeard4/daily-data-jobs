@@ -19,6 +19,7 @@ import time
 import traceback
 import urllib.parse
 
+import pyshorteners
 import requests
 
 from config.settings import (
@@ -321,14 +322,26 @@ def post_to_linkedin(post_text: str, ranked: dict | None = None, dry_run: bool =
 _SOCIAL_ACTIONS_BASE = "https://api.linkedin.com/v2/socialActions"
 
 
+def _shorten_url(url: str) -> str:
+    """Shorten a URL via TinyURL. Falls back to the original URL on any error."""
+    if not url:
+        return url
+    try:
+        s = pyshorteners.Shortener()
+        return s.tinyurl.short(url)
+    except Exception as exc:
+        logger.warning(f"URL shortening failed for {url[:80]} — using full URL. Error: {exc}")
+        return url
+
+
 def build_comment_text(ranked: dict) -> str:
-    """Build the apply-links comment text from ranked jobs."""
+    """Build the apply-links comment text from ranked jobs, with TinyURL-shortened links."""
     lines = ["🔗 Apply links:", ""]
     for cat in CATEGORY_ORDER:
         for job in ranked.get(cat, []):
             title = job.get("title", "Role")
             company = job.get("company", "Company")
-            url = job.get("apply_url", "")
+            url = _shorten_url(job.get("apply_url", ""))
             lines.append(f"{title} @ {company} → {url}")
     return "\n".join(lines)
 
